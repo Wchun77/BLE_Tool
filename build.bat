@@ -33,6 +33,7 @@ echo [3/3] Build complete!
 echo.
 echo Output files:
 echo - EXE: build\bin\Release\ble_tool.exe
-echo - DLL: build\lib\Release\ble_api.dll
+echo - DLL: build\bin\Release\ble_api.dll
+echo - LIB: build\lib\Release\ble_api.lib
 echo.
 pause

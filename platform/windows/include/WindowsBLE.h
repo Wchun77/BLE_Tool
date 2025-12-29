@@ -4,20 +4,7 @@
 #include <string>
 #include <map>
 #include <mutex>
-
-// 前向宣告 WinRT 類型
-namespace winrt {
-    namespace Windows::Devices::Bluetooth {
-        struct BluetoothLEDevice;
-    }
-    namespace Windows::Devices::Bluetooth::Advertisement {
-        struct BluetoothLEAdvertisementWatcher;
-    }
-    namespace Windows::Devices::Bluetooth::GenericAttributeProfile {
-        struct GattDeviceService;
-        struct GattCharacteristic;
-    }
-}
+#include <memory>
 
 namespace BLE {
 
@@ -77,6 +64,9 @@ private:
     std::map<std::string, DataCallback> notifyCallbacks_;
 
     void setError(const std::string& error);
+    
+    // 輔助函數（移到 .cpp 實作，避免型別問題）
+    uint64_t addressStringToUint64(const std::string& address);
 };
 
 } // namespace BLE

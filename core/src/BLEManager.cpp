@@ -19,7 +19,6 @@ bool BLEManager::initialize() {
     }
 
     try {
-        // 建立平台特定後端
         backend_ = createPlatformBackend();
         if (!backend_) {
             handleError("Failed to create platform backend");
@@ -61,7 +60,6 @@ bool BLEManager::startScan(int timeoutMs) {
 
     scannedDevices_.clear();
 
-    // 設定掃描回調包裝
     backend_->setScanCallback([this](const DeviceInfo& device) {
         scannedDevices_.push_back(device);
         if (scanCallback_) {
@@ -117,6 +115,24 @@ void BLEManager::setConnectionCallback(ConnectionCallback callback) {
     }
 }
 
+// 新增：根據名稱連線
+bool BLEManager::connectByName(const std::string& deviceName) {
+    if (!initialized_) {
+        handleError("BLE Manager not initialized");
+        return false;
+    }
+
+    // 從掃描結果中找到對應名稱的裝置
+    for (const auto& dev : scannedDevices_) {
+        if (dev.name == deviceName) {
+            return connect(dev.address);
+        }
+    }
+
+    handleError("Device not found: " + deviceName);
+    return false;
+}
+
 bool BLEManager::discoverServices() {
     if (!initialized_ || !backend_) {
         handleError("Not initialized or connected");
@@ -168,6 +184,22 @@ bool BLEManager::readData(
     }
 
     return backend_->readData(serviceUuid, charUuid, outData);
+}
+
+// 新增：寫入字串（便利函數，不包裝格式）
+bool BLEManager::writeString(
+    const std::string& serviceUuid,
+    const std::string& charUuid,
+    const std::string& data,
+    bool withResponse)
+{
+    return writeData(
+        serviceUuid,
+        charUuid,
+        reinterpret_cast<const uint8_t*>(data.c_str()),
+        data.length(),
+        withResponse
+    );
 }
 
 bool BLEManager::subscribeNotify(

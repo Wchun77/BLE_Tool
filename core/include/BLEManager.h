@@ -33,6 +33,9 @@ public:
     bool disconnect();
     bool isConnected() const;
     void setConnectionCallback(ConnectionCallback callback);
+    
+    // 便利函數：根據名稱連線
+    bool connectByName(const std::string& deviceName);
 
     // 服務/特性
     bool discoverServices();
@@ -51,6 +54,13 @@ public:
         const std::string& serviceUuid,
         const std::string& charUuid,
         std::vector<uint8_t>& outData);
+    
+    // 便利函數：寫入字串（不包裝格式）
+    bool writeString(
+        const std::string& serviceUuid,
+        const std::string& charUuid,
+        const std::string& data,
+        bool withResponse = true);
 
     // 通知
     bool subscribeNotify(

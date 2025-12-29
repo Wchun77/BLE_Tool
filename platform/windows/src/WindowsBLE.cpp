@@ -5,7 +5,14 @@
 #include <winrt/Windows.Devices.Bluetooth.Advertisement.h>
 #include <winrt/Windows.Devices.Bluetooth.GenericAttributeProfile.h>
 #include <winrt/Windows.Storage.Streams.h>
+#include <winrt/Windows.Devices.Enumeration.h>
 #include <set>
+#include <unordered_map>
+#include <sstream>
+#include <iomanip>
+#include <algorithm>
+#include <iostream>
+#include <thread>
 
 using namespace winrt;
 using namespace Windows::Foundation;
@@ -14,15 +21,16 @@ using namespace Windows::Devices::Bluetooth;
 using namespace Windows::Devices::Bluetooth::Advertisement;
 using namespace Windows::Devices::Bluetooth::GenericAttributeProfile;
 using namespace Windows::Storage::Streams;
+using namespace Windows::Devices::Enumeration;
 
 namespace BLE {
 
 struct WindowsBLE::Impl {
     BluetoothLEAdvertisementWatcher watcher{nullptr};
     BluetoothLEDevice device{nullptr};
-    std::map<std::string, GattDeviceService> services;
-    std::map<std::string, GattCharacteristic> characteristics;
-    std::set<std::string> seenDevices;  // 記錄已掃描的裝置地址
+    std::unordered_map<std::string, GattDeviceService> services;
+    std::unordered_map<std::string, GattCharacteristic> characteristics;
+    std::set<std::string> seenDevices;
     bool isConnected = false;
     
     Impl() = default;
@@ -40,9 +48,17 @@ WindowsBLE::~WindowsBLE() {
 
 bool WindowsBLE::initialize() {
     try {
+        // 嘗試預設初始化（通常是 MTA）
         init_apartment();
         return true;
     } catch (const hresult_error& ex) {
+        // 如果執行緒已經初始化過 COM（例如 WinForms 的 STA）
+        if (ex.code() == 0x80010106) {  // RPC_E_CHANGED_MODE
+            // 執行緒已經在某個 apartment 模式，直接使用它
+            return true;
+        }
+        
+        // 其他錯誤才真的失敗
         setError("WinRT initialization failed: " + to_string(ex.message()));
         return false;
     }
@@ -59,9 +75,12 @@ void WindowsBLE::shutdown() {
     pImpl_->seenDevices.clear();
 }
 
-// 輔助函數：取得廠商名稱
+// ============================================================================
+// 輔助函數（static，只在此檔案內使用）
+// ============================================================================
+
+// 取得廠商名稱
 static std::string getManufacturerName(uint16_t companyId) {
-    // 常見廠商 ID 對照表
     switch (companyId) {
         case 0x004C: return "Apple";
         case 0x0006: return "Microsoft";
@@ -73,7 +92,7 @@ static std::string getManufacturerName(uint16_t companyId) {
         case 0x0590: return "Logitech";
         case 0x0499: return "Ruuvi";
         case 0x0171: return "Nordic Semiconductor";
-        case 0x0822: return "Espressif";  // ESP32
+        case 0x0822: return "Espressif";
         default: {
             char name[32];
             sprintf_s(name, sizeof(name), "Vendor 0x%04X", companyId);
@@ -82,7 +101,7 @@ static std::string getManufacturerName(uint16_t companyId) {
     }
 }
 
-// 輔助函數：GUID 轉字串
+// GUID 轉字串
 static std::string guidToString(const winrt::guid& uuid) {
     char str[37];
     sprintf_s(str, sizeof(str), 
@@ -93,7 +112,29 @@ static std::string guidToString(const winrt::guid& uuid) {
     return str;
 }
 
-// 輔助函數：識別常見服務
+// 字串轉 GUID
+static winrt::guid stringToGuid(const std::string& uuidStr) {
+    // 移除所有 '-'
+    std::string clean = uuidStr;
+    clean.erase(std::remove(clean.begin(), clean.end(), '-'), clean.end());
+    
+    // 確保長度正確
+    if (clean.length() != 32) {
+        throw std::invalid_argument("Invalid UUID string");
+    }
+    
+    // 解析
+    winrt::guid uuid;
+    sscanf_s(clean.c_str(), 
+        "%8lx%4hx%4hx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx",
+        &uuid.Data1, &uuid.Data2, &uuid.Data3,
+        &uuid.Data4[0], &uuid.Data4[1], &uuid.Data4[2], &uuid.Data4[3],
+        &uuid.Data4[4], &uuid.Data4[5], &uuid.Data4[6], &uuid.Data4[7]);
+    
+    return uuid;
+}
+
+// 識別常見服務
 static std::string getServiceName(const std::string& uuid) {
     if (uuid.find("0000180f") == 0) return "Battery Service";
     if (uuid.find("0000180a") == 0) return "Device Information";
@@ -105,29 +146,45 @@ static std::string getServiceName(const std::string& uuid) {
     return "";
 }
 
+// ============================================================================
+// WindowsBLE 成員函數實作
+// ============================================================================
+
+// 地址字串轉 uint64_t
+uint64_t WindowsBLE::addressStringToUint64(const std::string& address) {
+    // "XX:XX:XX:XX:XX:XX" -> uint64_t
+    uint64_t addr = 0;
+    int values[6];
+    
+    if (sscanf_s(address.c_str(), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 &values[0], &values[1], &values[2], 
+                 &values[3], &values[4], &values[5]) != 6) {
+        return 0;
+    }
+    
+    for (int i = 0; i < 6; i++) {
+        addr = (addr << 8) | (values[i] & 0xFF);
+    }
+    
+    return addr;
+}
+
 bool WindowsBLE::startScan(int timeoutMs) {
     std::lock_guard<std::mutex> lock(mutex_);
     
-    (void)timeoutMs; // 暫時不處理 timeout
+    (void)timeoutMs;
     
     try {
-        // 清空已掃描裝置記錄
         pImpl_->seenDevices.clear();
-        
-        // 建立 Advertisement Watcher
         pImpl_->watcher = BluetoothLEAdvertisementWatcher();
-        
-        // 設定掃描模式（主動掃描以取得更多資訊）
         pImpl_->watcher.ScanningMode(BluetoothLEScanningMode::Active);
         
-        // 設定接收回調
         pImpl_->watcher.Received([this](
             BluetoothLEAdvertisementWatcher,
             BluetoothLEAdvertisementReceivedEventArgs args) {
             
             DeviceInfo info;
             
-            // === 1. 地址 ===
             uint64_t addr = args.BluetoothAddress();
             char addrStr[18];
             sprintf_s(addrStr, sizeof(addrStr), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -140,19 +197,16 @@ bool WindowsBLE::startScan(int timeoutMs) {
             );
             info.address = addrStr;
             
-            // === 過濾重複裝置 ===
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (pImpl_->seenDevices.count(info.address) > 0) {
-                    return; // 已經掃描過，跳過
+                    return;
                 }
                 pImpl_->seenDevices.insert(info.address);
             }
             
-            // === 2. RSSI ===
             info.rssi = args.RawSignalStrengthInDBm();
             
-            // === 3. 裝置名稱 ===
             auto localName = args.Advertisement().LocalName();
             if (!localName.empty()) {
                 info.name = to_string(localName);
@@ -162,26 +216,22 @@ bool WindowsBLE::startScan(int timeoutMs) {
                 info.name = "Unknown Device";
             }
             
-            // === 4. 廠商資訊 ===
             auto manufacturerData = args.Advertisement().ManufacturerData();
             if (manufacturerData.Size() > 0) {
                 auto data = manufacturerData.GetAt(0);
                 info.manufacturerId = data.CompanyId();
                 
-                // 如果沒有名稱，用廠商名稱代替
                 if (!info.hasName) {
                     info.name = getManufacturerName(info.manufacturerId);
                 }
             }
             
-            // === 5. 服務 UUID ===
             auto serviceUuids = args.Advertisement().ServiceUuids();
             for (uint32_t i = 0; i < serviceUuids.Size(); i++) {
                 auto uuid = serviceUuids.GetAt(i);
                 std::string uuidStr = guidToString(uuid);
                 info.serviceUuids.push_back(uuidStr);
                 
-                // 如果沒有名稱，嘗試用服務名稱
                 if (!info.hasName) {
                     std::string serviceName = getServiceName(uuidStr);
                     if (!serviceName.empty()) {
@@ -191,15 +241,12 @@ bool WindowsBLE::startScan(int timeoutMs) {
                 }
             }
             
-            // === 回調 ===
             if (scanCallback_) {
                 scanCallback_(info);
             }
         });
         
-        // 開始掃描
         pImpl_->watcher.Start();
-        
         return true;
         
     } catch (const hresult_error& ex) {
@@ -216,7 +263,6 @@ void WindowsBLE::stopScan() {
             pImpl_->watcher.Stop();
             pImpl_->watcher = nullptr;
         } catch (...) {
-            // 忽略停止時的錯誤
         }
     }
 }
@@ -226,9 +272,111 @@ void WindowsBLE::setScanCallback(ScanCallback callback) {
 }
 
 bool WindowsBLE::connect(const std::string& deviceAddress) {
-    (void)deviceAddress;
-    setError("Connect not implemented yet");
-    return false;
+    try {
+        uint64_t addr = addressStringToUint64(deviceAddress);
+        if (addr == 0) {
+            setError("Invalid device address format");
+            return false;
+        }
+        
+        // 1. 取得裝置
+        std::cout << "  Getting device..." << std::endl;
+        auto asyncOp = BluetoothLEDevice::FromBluetoothAddressAsync(addr);
+        pImpl_->device = asyncOp.get();
+        
+        if (!pImpl_->device) {
+            setError("Failed to get BluetoothLEDevice");
+            return false;
+        }
+        
+        // 2. 檢查配對狀態
+        auto deviceInfo = pImpl_->device.DeviceInformation();
+        auto pairing = deviceInfo.Pairing();
+        
+        std::cout << "  Checking pairing status..." << std::endl;
+        
+        if (!pairing.IsPaired()) {
+            std::cout << "  Device not paired. Initiating pairing..." << std::endl;
+            std::cout << "  >> Please enter PIN: 000000 in the Windows dialog" << std::endl;
+            
+            // 3. 發起配對（會觸發 Windows 對話框）
+            auto pairResult = pairing.PairAsync().get();
+            
+            if (pairResult.Status() == DevicePairingResultStatus::Paired) {
+                std::cout << "  Pairing successful!" << std::endl;
+            } else if (pairResult.Status() == DevicePairingResultStatus::AlreadyPaired) {
+                std::cout << "  Already paired" << std::endl;
+            } else {
+                std::string errorMsg = "Pairing failed: ";
+                switch (pairResult.Status()) {
+                    case DevicePairingResultStatus::PairingCanceled:
+                        errorMsg += "User canceled";
+                        break;
+                    case DevicePairingResultStatus::AuthenticationTimeout:
+                        errorMsg += "Authentication timeout";
+                        break;
+                    case DevicePairingResultStatus::AuthenticationFailure:
+                        errorMsg += "Authentication failure (wrong PIN?)";
+                        break;
+                    case DevicePairingResultStatus::ConnectionRejected:
+                        errorMsg += "Connection rejected";
+                        break;
+                    case DevicePairingResultStatus::Failed:
+                        errorMsg += "Failed";
+                        break;
+                    default:
+                        errorMsg += "Unknown error";
+                        break;
+                }
+                setError(errorMsg);
+                return false;
+            }
+        } else {
+            std::cout << "  Device already paired" << std::endl;
+        }
+        
+        // 4. 主動建立連線（透過 GATT 操作）
+        std::cout << "  Establishing connection..." << std::endl;
+        
+        try {
+            // 嘗試獲取 GATT 服務來觸發連線
+            auto servicesResult = pImpl_->device.GetGattServicesAsync(
+                BluetoothCacheMode::Uncached  // 強制建立新連線
+            ).get();
+            
+            if (servicesResult.Status() != GattCommunicationStatus::Success) {
+                setError("Failed to connect to device (GATT error)");
+                return false;
+            }
+            
+            std::cout << "  Connection established!" << std::endl;
+            
+        } catch (const hresult_error& ex) {
+            setError("Failed to establish connection: " + to_string(ex.message()));
+            return false;
+        }
+        
+        // 5. 確認連線狀態
+        auto status = pImpl_->device.ConnectionStatus();
+        pImpl_->isConnected = (status == BluetoothConnectionStatus::Connected);
+        
+        if (!pImpl_->isConnected) {
+            setError("Device did not connect");
+            return false;
+        }
+        
+        std::cout << "  Connected!" << std::endl;
+        
+        if (connectionCallback_) {
+            connectionCallback_(pImpl_->isConnected, "Connected");
+        }
+        
+        return true;
+        
+    } catch (const hresult_error& ex) {
+        setError("Connect failed: " + to_string(ex.message()));
+        return false;
+    }
 }
 
 bool WindowsBLE::disconnect() {
@@ -244,7 +392,6 @@ bool WindowsBLE::disconnect() {
                 connectionCallback_(false, "Disconnected");
             }
         } catch (...) {
-            // 忽略錯誤
         }
     }
     
@@ -261,17 +408,72 @@ void WindowsBLE::setConnectionCallback(ConnectionCallback callback) {
 }
 
 bool WindowsBLE::discoverServices() {
-    setError("Discover services not implemented yet");
-    return false;
+    try {
+        if (!pImpl_->device) {
+            setError("Not connected");
+            return false;
+        }
+        
+        pImpl_->services.clear();
+        pImpl_->characteristics.clear();
+        
+        // 取得所有 GATT 服務
+        auto servicesResult = pImpl_->device.GetGattServicesAsync().get();
+        
+        if (servicesResult.Status() != GattCommunicationStatus::Success) {
+            setError("Failed to discover services");
+            return false;
+        }
+        
+        auto services = servicesResult.Services();
+        for (uint32_t i = 0; i < services.Size(); i++) {
+            auto service = services.GetAt(i);
+            std::string uuid = guidToString(service.Uuid());
+            
+            // 使用 emplace 而不是 operator[]
+            pImpl_->services.emplace(uuid, service);
+            
+            auto charsResult = service.GetCharacteristicsAsync().get();
+            if (charsResult.Status() == GattCommunicationStatus::Success) {
+                auto chars = charsResult.Characteristics();
+                for (uint32_t j = 0; j < chars.Size(); j++) {
+                    auto characteristic = chars.GetAt(j);
+                    std::string charUuid = guidToString(characteristic.Uuid());
+                    
+                    // 使用 emplace
+                    pImpl_->characteristics.emplace(uuid + ":" + charUuid, characteristic);
+                }
+            }
+        }
+        
+        return true;
+        
+    } catch (const hresult_error& ex) {
+        setError("Discover services failed: " + to_string(ex.message()));
+        return false;
+    }
 }
 
 std::vector<std::string> WindowsBLE::getServices() {
-    return {};
+    std::vector<std::string> result;
+    for (const auto& pair : pImpl_->services) {
+        result.push_back(pair.first);
+    }
+    return result;
 }
 
 std::vector<std::string> WindowsBLE::getCharacteristics(const std::string& serviceUuid) {
-    (void)serviceUuid;
-    return {};
+    std::vector<std::string> result;
+    std::string prefix = serviceUuid + ":";
+    
+    for (const auto& pair : pImpl_->characteristics) {
+        if (pair.first.find(prefix) == 0) {
+            std::string charUuid = pair.first.substr(prefix.length());
+            result.push_back(charUuid);
+        }
+    }
+    
+    return result;
 }
 
 bool WindowsBLE::writeData(
@@ -281,13 +483,41 @@ bool WindowsBLE::writeData(
     size_t length,
     bool withResponse)
 {
-    (void)serviceUuid;
-    (void)charUuid;
-    (void)data;
-    (void)length;
-    (void)withResponse;
-    setError("Write data not implemented yet");
-    return false;
+    try {
+        std::string key = serviceUuid + ":" + charUuid;
+        auto it = pImpl_->characteristics.find(key);
+        
+        if (it == pImpl_->characteristics.end()) {
+            setError("Characteristic not found");
+            return false;
+        }
+        
+        auto characteristic = it->second;
+        
+        // 建立資料緩衝區
+        DataWriter writer;
+        writer.WriteBytes(array_view<const uint8_t>(data, data + length));
+        auto buffer = writer.DetachBuffer();
+        
+        // 寫入選項
+        auto writeOption = withResponse ? 
+            GattWriteOption::WriteWithResponse : 
+            GattWriteOption::WriteWithoutResponse;
+        
+        // 寫入資料
+        auto writeResult = characteristic.WriteValueWithResultAsync(buffer, writeOption).get();
+        
+        if (writeResult.Status() != GattCommunicationStatus::Success) {
+            setError("Write failed");
+            return false;
+        }
+        
+        return true;
+        
+    } catch (const hresult_error& ex) {
+        setError("Write data failed: " + to_string(ex.message()));
+        return false;
+    }
 }
 
 bool WindowsBLE::readData(
@@ -295,11 +525,35 @@ bool WindowsBLE::readData(
     const std::string& charUuid,
     std::vector<uint8_t>& outData)
 {
-    (void)serviceUuid;
-    (void)charUuid;
-    (void)outData;
-    setError("Read data not implemented yet");
-    return false;
+    try {
+        std::string key = serviceUuid + ":" + charUuid;
+        auto it = pImpl_->characteristics.find(key);
+        
+        if (it == pImpl_->characteristics.end()) {
+            setError("Characteristic not found");
+            return false;
+        }
+        
+        auto characteristic = it->second;
+        auto readResult = characteristic.ReadValueAsync().get();
+        
+        if (readResult.Status() != GattCommunicationStatus::Success) {
+            setError("Read failed");
+            return false;
+        }
+        
+        auto buffer = readResult.Value();
+        DataReader reader = DataReader::FromBuffer(buffer);
+        
+        outData.resize(buffer.Length());
+        reader.ReadBytes(outData);
+        
+        return true;
+        
+    } catch (const hresult_error& ex) {
+        setError("Read data failed: " + to_string(ex.message()));
+        return false;
+    }
 }
 
 bool WindowsBLE::subscribeNotify(
@@ -307,21 +561,81 @@ bool WindowsBLE::subscribeNotify(
     const std::string& charUuid,
     DataCallback callback)
 {
-    (void)serviceUuid;
-    (void)charUuid;
-    (void)callback;
-    setError("Subscribe notify not implemented yet");
-    return false;
+    try {
+        std::string key = serviceUuid + ":" + charUuid;
+        auto it = pImpl_->characteristics.find(key);
+        
+        if (it == pImpl_->characteristics.end()) {
+            setError("Characteristic not found");
+            return false;
+        }
+        
+        auto characteristic = it->second;
+        
+        // 儲存回調
+        notifyCallbacks_[key] = callback;
+        
+        // 註冊值變化事件
+        characteristic.ValueChanged([this, key](
+            GattCharacteristic const&,
+            GattValueChangedEventArgs args) {
+            
+            auto buffer = args.CharacteristicValue();
+            DataReader reader = DataReader::FromBuffer(buffer);
+            
+            std::vector<uint8_t> data(buffer.Length());
+            reader.ReadBytes(data);
+            
+            if (notifyCallbacks_.count(key) > 0 && notifyCallbacks_[key]) {
+                notifyCallbacks_[key](data.data(), data.size());
+            }
+        });
+        
+        // 寫入 CCCD 啟用通知
+        auto result = characteristic.WriteClientCharacteristicConfigurationDescriptorAsync(
+            GattClientCharacteristicConfigurationDescriptorValue::Notify
+        ).get();
+        
+        if (result != GattCommunicationStatus::Success) {
+            setError("Failed to enable notifications");
+            return false;
+        }
+        
+        return true;
+        
+    } catch (const hresult_error& ex) {
+        setError("Subscribe notify failed: " + to_string(ex.message()));
+        return false;
+    }
 }
 
 bool WindowsBLE::unsubscribeNotify(
     const std::string& serviceUuid,
     const std::string& charUuid)
 {
-    (void)serviceUuid;
-    (void)charUuid;
-    setError("Unsubscribe notify not implemented yet");
-    return false;
+    try {
+        std::string key = serviceUuid + ":" + charUuid;
+        auto it = pImpl_->characteristics.find(key);
+        
+        if (it == pImpl_->characteristics.end()) {
+            return false;
+        }
+        
+        auto characteristic = it->second;
+        
+        // 停用通知
+        characteristic.WriteClientCharacteristicConfigurationDescriptorAsync(
+            GattClientCharacteristicConfigurationDescriptorValue::None
+        ).get();
+        
+        // 移除回調
+        notifyCallbacks_.erase(key);
+        
+        return true;
+        
+    } catch (...) {
+        return false;
+    }
 }
 
 std::string WindowsBLE::getLastError() const {
@@ -334,7 +648,6 @@ void WindowsBLE::setError(const std::string& error) {
     lastError_ = error;
 }
 
-// 工廠函數實作
 std::unique_ptr<IBLEBackend> createPlatformBackend() {
     return std::make_unique<WindowsBLE>();
 }
