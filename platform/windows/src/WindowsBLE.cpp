@@ -32,6 +32,8 @@ struct WindowsBLE::Impl {
     std::unordered_map<std::string, GattCharacteristic> characteristics;
     std::set<std::string> seenDevices;
     bool isConnected = false;
+    bool scanStopped = false;
+
     
     Impl() = default;
     ~Impl() = default;
@@ -170,83 +172,113 @@ uint64_t WindowsBLE::addressStringToUint64(const std::string& address) {
 }
 
 bool WindowsBLE::startScan(int timeoutMs) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    (void)timeoutMs;
-    
     try {
-        pImpl_->seenDevices.clear();
-        pImpl_->watcher = BluetoothLEAdvertisementWatcher();
-        pImpl_->watcher.ScanningMode(BluetoothLEScanningMode::Active);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pImpl_->scanStopped = false;
+            pImpl_->seenDevices.clear();
+            pImpl_->watcher = BluetoothLEAdvertisementWatcher();
+            pImpl_->watcher.ScanningMode(BluetoothLEScanningMode::Active);
+            
+            pImpl_->watcher.Received([this](
+                BluetoothLEAdvertisementWatcher,
+                BluetoothLEAdvertisementReceivedEventArgs args) {
+                
+                DeviceInfo info;
+                
+                uint64_t addr = args.BluetoothAddress();
+                char addrStr[18];
+                sprintf_s(addrStr, sizeof(addrStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                    (unsigned char)((addr >> 40) & 0xFF),
+                    (unsigned char)((addr >> 32) & 0xFF),
+                    (unsigned char)((addr >> 24) & 0xFF),
+                    (unsigned char)((addr >> 16) & 0xFF),
+                    (unsigned char)((addr >> 8) & 0xFF),
+                    (unsigned char)(addr & 0xFF)
+                );
+                info.address = addrStr;
+                
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (pImpl_->seenDevices.count(info.address) > 0) {
+                        return;
+                    }
+                    pImpl_->seenDevices.insert(info.address);
+                }
+                
+                info.rssi = args.RawSignalStrengthInDBm();
+                
+                auto localName = args.Advertisement().LocalName();
+                if (!localName.empty()) {
+                    info.name = to_string(localName);
+                    info.hasName = true;
+                } else {
+                    info.hasName = false;
+                    info.name = "Unknown Device";
+                }
+                
+                auto manufacturerData = args.Advertisement().ManufacturerData();
+                if (manufacturerData.Size() > 0) {
+                    auto data = manufacturerData.GetAt(0);
+                    info.manufacturerId = data.CompanyId();
+                    
+                    if (!info.hasName) {
+                        info.name = getManufacturerName(info.manufacturerId);
+                    }
+                }
+                
+                auto serviceUuids = args.Advertisement().ServiceUuids();
+                for (uint32_t i = 0; i < serviceUuids.Size(); i++) {
+                    auto uuid = serviceUuids.GetAt(i);
+                    std::string uuidStr = guidToString(uuid);
+                    info.serviceUuids.push_back(uuidStr);
+                    
+                    if (!info.hasName) {
+                        std::string serviceName = getServiceName(uuidStr);
+                        if (!serviceName.empty()) {
+                            info.name = serviceName + " Device";
+                            break;
+                        }
+                    }
+                }
+                
+                if (scanCallback_) {
+                    scanCallback_(info);
+                }
+            });
+            
+            pImpl_->watcher.Start();
+        }  // ✅ 解鎖 mutex，讓回調可以執行
         
-        pImpl_->watcher.Received([this](
-            BluetoothLEAdvertisementWatcher,
-            BluetoothLEAdvertisementReceivedEventArgs args) {
-            
-            DeviceInfo info;
-            
-            uint64_t addr = args.BluetoothAddress();
-            char addrStr[18];
-            sprintf_s(addrStr, sizeof(addrStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-                (unsigned char)((addr >> 40) & 0xFF),
-                (unsigned char)((addr >> 32) & 0xFF),
-                (unsigned char)((addr >> 24) & 0xFF),
-                (unsigned char)((addr >> 16) & 0xFF),
-                (unsigned char)((addr >> 8) & 0xFF),
-                (unsigned char)(addr & 0xFF)
-            );
-            info.address = addrStr;
-            
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (pImpl_->seenDevices.count(info.address) > 0) {
-                    return;
-                }
-                pImpl_->seenDevices.insert(info.address);
-            }
-            
-            info.rssi = args.RawSignalStrengthInDBm();
-            
-            auto localName = args.Advertisement().LocalName();
-            if (!localName.empty()) {
-                info.name = to_string(localName);
-                info.hasName = true;
-            } else {
-                info.hasName = false;
-                info.name = "Unknown Device";
-            }
-            
-            auto manufacturerData = args.Advertisement().ManufacturerData();
-            if (manufacturerData.Size() > 0) {
-                auto data = manufacturerData.GetAt(0);
-                info.manufacturerId = data.CompanyId();
+        // ✅ 阻塞等待掃描完成
+        if (timeoutMs > 0) {
+            int elapsed = 0;
+            while (elapsed < timeoutMs) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                elapsed += 100;
                 
-                if (!info.hasName) {
-                    info.name = getManufacturerName(info.manufacturerId);
-                }
-            }
-            
-            auto serviceUuids = args.Advertisement().ServiceUuids();
-            for (uint32_t i = 0; i < serviceUuids.Size(); i++) {
-                auto uuid = serviceUuids.GetAt(i);
-                std::string uuidStr = guidToString(uuid);
-                info.serviceUuids.push_back(uuidStr);
-                
-                if (!info.hasName) {
-                    std::string serviceName = getServiceName(uuidStr);
-                    if (!serviceName.empty()) {
-                        info.name = serviceName + " Device";
-                        break;
+                // 檢查是否已手動停止
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (pImpl_->scanStopped) {
+                        return true;  // 手動停止，提前返回
                     }
                 }
             }
             
-            if (scanCallback_) {
-                scanCallback_(info);
+            // 時間到，自動停止
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (pImpl_->watcher) {
+                    try {
+                        pImpl_->watcher.Stop();
+                        pImpl_->watcher = nullptr;
+                    } catch (...) {
+                    }
+                }
             }
-        });
+        }
         
-        pImpl_->watcher.Start();
         return true;
         
     } catch (const hresult_error& ex) {
@@ -257,6 +289,8 @@ bool WindowsBLE::startScan(int timeoutMs) {
 
 void WindowsBLE::stopScan() {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    pImpl_->scanStopped = true;
     
     if (pImpl_->watcher) {
         try {
