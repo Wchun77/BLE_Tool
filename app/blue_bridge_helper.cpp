@@ -51,34 +51,35 @@ bool Helper::scanAndConnect(int scanTimeMs) {
         bool found = false;
         std::string foundAddress;
         
-        // ✅ 改成用 Service UUID 找
-        ble_.setScanCallback([&found, &foundAddress](const BLE::DeviceInfo& dev) {
+        auto foundCallback = [&found, &foundAddress, this](const BLE::DeviceInfo& dev) {
             // 檢查是否有目標服務
             for (const auto& uuid : dev.serviceUuids) {
                 if (uuid == SERVICE_UUID || uuid.find("00000d20") != std::string::npos) {
                     found = true;
                     foundAddress = dev.address;
                     std::cout << "  Found Blue Bridge!" << std::endl;
+                    std::cout << "    Name:    " << dev.name << std::endl;
                     std::cout << "    Address: " << dev.address << std::endl;
-                    std::cout << "    RSSI: " << dev.rssi << " dBm" << std::endl;
+                    std::cout << "    RSSI:    " << dev.rssi << " dBm" << std::endl;
+                    
+                    ble_.stopScan();
                     return;
                 }
             }
-        });
+        };
         
-        if (!ble_.startScan(scanTimeMs)) {
+        if (!ble_.startScan(scanTimeMs, BLE::ScanMode::Active, foundCallback, nullptr)) {
             setError("Failed to start scan: " + ble_.getLastError());
             return false;
         }
         
-        std::this_thread::sleep_for(std::chrono::milliseconds(scanTimeMs + 1000));
-        ble_.stopScan();
         
         if (!found) {
             setError("Blue Bridge service not found (UUID: " + SERVICE_UUID + ")");
             return false;
         }
         
+        std::cout << "Connecting to Blue Bridge..." << std::endl;
         return connect(foundAddress);
         
     } catch (const std::exception& e) {
@@ -202,7 +203,7 @@ bool Helper::subscribeResponse(std::function<void(const std::string&)> callback)
                 std::string raw(reinterpret_cast<const char*>(data), len);
                 std::string unwrapped = CommandWrapper::unwrap(raw);
                 
-                // ✅ 更徹底地移除所有前後的 \r 和 \n
+                // 更徹底地移除所有前後的 \r 和 \n
                 size_t start = 0;
                 while (start < unwrapped.length() && 
                        (unwrapped[start] == '\r' || unwrapped[start] == '\n' || 

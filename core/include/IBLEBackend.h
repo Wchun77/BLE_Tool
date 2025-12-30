@@ -14,10 +14,13 @@ public:
     virtual bool initialize() = 0;
     virtual void shutdown() = 0;
 
-    // 掃描
-    virtual bool startScan(int timeoutMs) = 0;
+    // 掃描（修改）
+    virtual bool startScan(
+        int timeoutMs,
+        ScanMode mode,
+        ScanFoundCallback foundCallback,
+        ScanUpdatedCallback updatedCallback) = 0;
     virtual void stopScan() = 0;
-    virtual void setScanCallback(ScanCallback callback) = 0;
 
     // 連線
     virtual bool connect(const std::string& deviceAddress) = 0;

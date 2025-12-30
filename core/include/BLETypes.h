@@ -7,21 +7,29 @@
 
 namespace BLE {
 
-// 裝置資訊（增強版）
+// 掃描模式
+enum class ScanMode {
+    Active = 0,   // 發送 Scan Request（可收到 Scan Response）
+    Passive = 1   // 不發送 Scan Request（省電但可能無 LocalName）
+};
+
+// 裝置資訊
 struct DeviceInfo {
     std::string name;
     std::string address;
     int16_t rssi;
     
     // 新增欄位
-    uint16_t manufacturerId;        // 廠商 ID (0 表示無)
+    uint16_t manufacturerId;                // 廠商 ID (0 表示無)
     std::vector<std::string> serviceUuids;  // 服務 UUID 列表
-    bool hasName;                   // 是否有廣播名稱
+    bool hasName;                           // 是否有廣播名稱
+    uint64_t timestamp;                     // Unix timestamp (milliseconds)
     
     DeviceInfo() 
         : rssi(0)
         , manufacturerId(0)
         , hasName(false)
+        , timestamp(0)
     {}
     
     DeviceInfo(const std::string& n, const std::string& a, int16_t r)
@@ -30,6 +38,7 @@ struct DeviceInfo {
         , rssi(r)
         , manufacturerId(0)
         , hasName(!n.empty() && n != "Unknown Device")
+        , timestamp(0)
     {}
 };
 
@@ -54,7 +63,9 @@ enum class CharacteristicProperty : uint32_t {
 };
 
 // 回調函數類型
-using ScanCallback = std::function<void(const DeviceInfo&)>;
+using ScanFoundCallback = std::function<void(const DeviceInfo&)>;
+using ScanUpdatedCallback = std::function<void(const DeviceInfo&)>;
+
 using DataCallback = std::function<void(const uint8_t*, size_t)>;
 using ConnectionCallback = std::function<void(bool connected, const std::string& message)>;
 using ErrorCallback = std::function<void(const std::string& error)>;

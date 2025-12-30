@@ -52,7 +52,12 @@ bool BLEManager::isInitialized() const {
     return initialized_;
 }
 
-bool BLEManager::startScan(int timeoutMs) {
+bool BLEManager::startScan(
+    int timeoutMs,
+    ScanMode mode,
+    ScanFoundCallback foundCallback,
+    ScanUpdatedCallback updatedCallback)
+{
     if (!initialized_) {
         handleError("BLE Manager not initialized");
         return false;
@@ -60,24 +65,43 @@ bool BLEManager::startScan(int timeoutMs) {
 
     scannedDevices_.clear();
 
-    backend_->setScanCallback([this](const DeviceInfo& device) {
-        scannedDevices_.push_back(device);
-        if (scanCallback_) {
-            scanCallback_(device);
-        }
-    });
+    // 包裝 found 回調（加入儲存到 scannedDevices_）
+    ScanFoundCallback wrappedFoundCallback = nullptr;
+    if (foundCallback) {
+        wrappedFoundCallback = [this, foundCallback](const DeviceInfo& device) {
+            scannedDevices_.push_back(device);
+            foundCallback(device);
+        };
+    }
 
-    return backend_->startScan(timeoutMs);
+    // updated 回調直接傳遞（不儲存到 scannedDevices_）
+    ScanUpdatedCallback wrappedUpdatedCallback = nullptr;
+    if (updatedCallback) {
+        wrappedUpdatedCallback = [this, updatedCallback](const DeviceInfo& device) {
+            // 更新 scannedDevices_ 中的資料（如果存在）
+            for (auto& dev : scannedDevices_) {
+                if (dev.address == device.address) {
+                    dev.rssi = device.rssi;
+                    dev.timestamp = device.timestamp;
+                    // 更新名稱（如果 Scan Response 延遲）
+                    if (device.hasName && !dev.hasName) {
+                        dev.name = device.name;
+                        dev.hasName = device.hasName;
+                    }
+                    break;
+                }
+            }
+            updatedCallback(device);
+        };
+    }
+
+    return backend_->startScan(timeoutMs, mode, wrappedFoundCallback, wrappedUpdatedCallback);
 }
 
 void BLEManager::stopScan() {
     if (backend_) {
         backend_->stopScan();
     }
-}
-
-void BLEManager::setScanCallback(ScanCallback callback) {
-    scanCallback_ = callback;
 }
 
 std::vector<DeviceInfo> BLEManager::getScannedDevices() const {
@@ -115,7 +139,7 @@ void BLEManager::setConnectionCallback(ConnectionCallback callback) {
     }
 }
 
-// 新增：根據名稱連線
+// 根據名稱連線
 bool BLEManager::connectByName(const std::string& deviceName) {
     if (!initialized_) {
         handleError("BLE Manager not initialized");
@@ -186,7 +210,7 @@ bool BLEManager::readData(
     return backend_->readData(serviceUuid, charUuid, outData);
 }
 
-// 新增：寫入字串（便利函數，不包裝格式）
+// 寫入字串（便利函數，不包裝格式）
 bool BLEManager::writeString(
     const std::string& serviceUuid,
     const std::string& charUuid,

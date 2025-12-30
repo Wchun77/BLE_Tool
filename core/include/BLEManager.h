@@ -23,9 +23,12 @@ public:
     bool isInitialized() const;
 
     // 掃描
-    bool startScan(int timeoutMs = 5000);
+    bool startScan(
+        int timeoutMs,
+        ScanMode mode,
+        ScanFoundCallback foundCallback,
+        ScanUpdatedCallback updatedCallback);
     void stopScan();
-    void setScanCallback(ScanCallback callback);
     std::vector<DeviceInfo> getScannedDevices() const;
 
     // 連線
@@ -34,7 +37,7 @@ public:
     bool isConnected() const;
     void setConnectionCallback(ConnectionCallback callback);
     
-    // 便利函數：根據名稱連線
+    // 根據名稱連線
     bool connectByName(const std::string& deviceName);
 
     // 服務/特性
@@ -79,7 +82,6 @@ public:
 private:
     std::unique_ptr<IBLEBackend> backend_;
     std::vector<DeviceInfo> scannedDevices_;
-    ScanCallback scanCallback_;
     ErrorCallback errorCallback_;
     bool initialized_;
     

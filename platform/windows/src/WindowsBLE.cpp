@@ -6,6 +6,7 @@
 #include <winrt/Windows.Devices.Bluetooth.GenericAttributeProfile.h>
 #include <winrt/Windows.Storage.Streams.h>
 #include <winrt/Windows.Devices.Enumeration.h>
+#include "Windows.h"
 #include <set>
 #include <unordered_map>
 #include <sstream>
@@ -25,12 +26,23 @@ using namespace Windows::Devices::Enumeration;
 
 namespace BLE {
 
+// 廣播配對結構
+struct AdvPair {
+    BluetoothLEAdvertisementReceivedEventArgs adv{nullptr};
+    BluetoothLEAdvertisementReceivedEventArgs scan{nullptr};
+    std::chrono::steady_clock::time_point firstSeen;
+    bool reported = false;
+};
+
 struct WindowsBLE::Impl {
     BluetoothLEAdvertisementWatcher watcher{nullptr};
     BluetoothLEDevice device{nullptr};
+    GattSession session{nullptr};
     std::unordered_map<std::string, GattDeviceService> services;
     std::unordered_map<std::string, GattCharacteristic> characteristics;
+    std::unordered_map<std::string, event_token> notifyTokens; // 儲存通知訂閱的 token
     std::set<std::string> seenDevices;
+    std::unordered_map<std::string, AdvPair> advPairs;  // 儲存配對
     bool isConnected = false;
     bool scanStopped = false;
 
@@ -75,6 +87,7 @@ void WindowsBLE::shutdown() {
     pImpl_->services.clear();
     pImpl_->characteristics.clear();
     pImpl_->seenDevices.clear();
+    pImpl_->advPairs.clear();  // 清理配對
 }
 
 // ============================================================================
@@ -171,21 +184,151 @@ uint64_t WindowsBLE::addressStringToUint64(const std::string& address) {
     return addr;
 }
 
-bool WindowsBLE::startScan(int timeoutMs) {
+// 從配對中提取裝置資訊
+DeviceInfo WindowsBLE::extractDeviceInfo(const std::string& address, const AdvPair& pair) {
+    DeviceInfo info;
+    info.address = address;
+    
+    // 設定 timestamp
+    auto now = std::chrono::system_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+    info.timestamp = ms.count();
+    
+    // 取得 RSSI
+    if (pair.scan) {
+        info.rssi = pair.scan.RawSignalStrengthInDBm();
+    } else if (pair.adv) {
+        info.rssi = pair.adv.RawSignalStrengthInDBm();
+    }
+    
+    // 從兩個封包中提取資料
+    std::vector<BluetoothLEAdvertisementReceivedEventArgs> sources;
+    if (pair.adv) sources.push_back(pair.adv);
+    if (pair.scan) sources.push_back(pair.scan);
+    
+    // 優先從 Scan Response 取 LocalName
+    std::string deviceName;
+    bool hasName = false;
+    
+    for (const auto& source : sources) {
+        if (hasName) break;
+        
+        // LocalName API
+        auto localName = source.Advertisement().LocalName();
+        if (!localName.empty()) {
+            try {
+                std::wstring wname(localName.c_str());
+                int len = WideCharToMultiByte(CP_UTF8, 0, wname.c_str(), -1, nullptr, 0, nullptr, nullptr);
+                if (len > 1) {
+                    deviceName.resize(len - 1);
+                    WideCharToMultiByte(CP_UTF8, 0, wname.c_str(), -1, &deviceName[0], len, nullptr, nullptr);
+                    hasName = !deviceName.empty();
+                }
+            } catch (...) {}
+        }
+        
+        // DataSections
+        if (!hasName) {
+            try {
+                auto dataSections = source.Advertisement().DataSections();
+                for (uint32_t i = 0; i < dataSections.Size(); i++) {
+                    auto section = dataSections.GetAt(i);
+                    uint8_t dataType = section.DataType();
+                    
+                    if (dataType == 0x08 || dataType == 0x09) {
+                        auto buffer = section.Data();
+                        auto reader = DataReader::FromBuffer(buffer);
+                        
+                        uint32_t bufferLen = reader.UnconsumedBufferLength();
+                        if (bufferLen > 0) {
+                            std::vector<uint8_t> nameBytes(bufferLen);
+                            reader.ReadBytes(nameBytes);
+                            deviceName = std::string(nameBytes.begin(), nameBytes.end());
+                            
+                            while (!deviceName.empty() && deviceName.back() == '\0') {
+                                deviceName.pop_back();
+                            }
+                            
+                            if (!deviceName.empty()) {
+                                hasName = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            } catch (...) {}
+        }
+    }
+    
+    info.name = hasName ? deviceName : "Unknown Device";
+    info.hasName = hasName;
+    
+    // Manufacturer Data 和 Service UUIDs
+    for (const auto& source : sources) {
+        if (info.manufacturerId == 0) {
+            auto manufacturerData = source.Advertisement().ManufacturerData();
+            if (manufacturerData.Size() > 0) {
+                auto data = manufacturerData.GetAt(0);
+                info.manufacturerId = data.CompanyId();
+            }
+        }
+        
+        auto serviceUuids = source.Advertisement().ServiceUuids();
+        for (uint32_t i = 0; i < serviceUuids.Size(); i++) {
+            auto uuid = serviceUuids.GetAt(i);
+            std::string uuidStr = guidToString(uuid);
+            
+            if (std::find(info.serviceUuids.begin(), info.serviceUuids.end(), uuidStr) == info.serviceUuids.end()) {
+                info.serviceUuids.push_back(uuidStr);
+            }
+        }
+    }
+    
+    // 如果沒有名稱，用廠商或服務名稱
+    if (!info.hasName) {
+        if (info.manufacturerId != 0) {
+            info.name = getManufacturerName(info.manufacturerId);
+        } else if (!info.serviceUuids.empty()) {
+            std::string serviceName = getServiceName(info.serviceUuids[0]);
+            if (!serviceName.empty()) {
+                info.name = serviceName + " Device";
+            }
+        }
+    }
+    
+    return info;
+}
+
+bool WindowsBLE::startScan(
+    int timeoutMs,
+    ScanMode mode,
+    ScanFoundCallback foundCallback,
+    ScanUpdatedCallback updatedCallback)
+{
     try {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             pImpl_->scanStopped = false;
-            pImpl_->seenDevices.clear();
+            pImpl_->advPairs.clear();
+            
+            // 儲存回調
+            scanFoundCallback_ = foundCallback;
+            scanUpdatedCallback_ = updatedCallback;
+            
             pImpl_->watcher = BluetoothLEAdvertisementWatcher();
-            pImpl_->watcher.ScanningMode(BluetoothLEScanningMode::Active);
+            
+            // 設定掃描模式
+            if (mode == ScanMode::Active) {
+                pImpl_->watcher.ScanningMode(BluetoothLEScanningMode::Active);
+            } else {
+                pImpl_->watcher.ScanningMode(BluetoothLEScanningMode::Passive);
+            }
             
             pImpl_->watcher.Received([this](
                 BluetoothLEAdvertisementWatcher,
                 BluetoothLEAdvertisementReceivedEventArgs args) {
                 
-                DeviceInfo info;
-                
+                // 解析地址
                 uint64_t addr = args.BluetoothAddress();
                 char addrStr[18];
                 sprintf_s(addrStr, sizeof(addrStr), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -196,85 +339,128 @@ bool WindowsBLE::startScan(int timeoutMs) {
                     (unsigned char)((addr >> 8) & 0xFF),
                     (unsigned char)(addr & 0xFF)
                 );
-                info.address = addrStr;
+                std::string address = addrStr;
+                
+                auto advType = args.AdvertisementType();
+                bool isScanResponse = (advType == BluetoothLEAdvertisementType::ScanResponse);
+                
+                bool triggerFound = false;
+                bool triggerUpdated = false;
+                DeviceInfo info;
                 
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    if (pImpl_->seenDevices.count(info.address) > 0) {
-                        return;
-                    }
-                    pImpl_->seenDevices.insert(info.address);
-                }
-                
-                info.rssi = args.RawSignalStrengthInDBm();
-                
-                auto localName = args.Advertisement().LocalName();
-                if (!localName.empty()) {
-                    info.name = to_string(localName);
-                    info.hasName = true;
-                } else {
-                    info.hasName = false;
-                    info.name = "Unknown Device";
-                }
-                
-                auto manufacturerData = args.Advertisement().ManufacturerData();
-                if (manufacturerData.Size() > 0) {
-                    auto data = manufacturerData.GetAt(0);
-                    info.manufacturerId = data.CompanyId();
                     
-                    if (!info.hasName) {
-                        info.name = getManufacturerName(info.manufacturerId);
-                    }
-                }
-                
-                auto serviceUuids = args.Advertisement().ServiceUuids();
-                for (uint32_t i = 0; i < serviceUuids.Size(); i++) {
-                    auto uuid = serviceUuids.GetAt(i);
-                    std::string uuidStr = guidToString(uuid);
-                    info.serviceUuids.push_back(uuidStr);
+                    auto& pair = pImpl_->advPairs[address];
                     
-                    if (!info.hasName) {
-                        std::string serviceName = getServiceName(uuidStr);
-                        if (!serviceName.empty()) {
-                            info.name = serviceName + " Device";
-                            break;
+                    if (isScanResponse) {
+                        // Scan Response
+                        pair.scan = args;
+                        
+                        if (pair.adv && !pair.reported) {
+                            // 有 Advertisement 且未報告 → 觸發 found
+                            pair.reported = true;
+                            info = extractDeviceInfo(address, pair);
+                            triggerFound = true;
+                        } else if (pair.reported) {
+                            // 已報告 → 觸發 updated（如果有 callback）
+                            if (scanUpdatedCallback_) {
+                                info = extractDeviceInfo(address, pair);
+                                triggerUpdated = true;
+                            }
+                        }
+                    } else {
+                        // Advertisement
+                        bool isFirstAdv = !pair.adv;
+                        
+                        if (isFirstAdv) {
+                            // 第一次收到 Advertisement
+                            pair.firstSeen = std::chrono::steady_clock::now();
+                            pair.adv = args;
+                            // 不觸發，等待 Scan Response
+                        } else {
+                            // 重複的 Advertisement
+                            pair.adv = args;
+                            
+                            if (pair.scan && !pair.reported) {
+                                // 有 Scan Response 且未報告 → 觸發 found
+                                pair.reported = true;
+                                info = extractDeviceInfo(address, pair);
+                                triggerFound = true;
+                            } else if (!pair.reported) {
+                                // 無 Scan Response，檢查超時
+                                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - pair.firstSeen
+                                ).count();
+                                
+                                if (elapsed >= 150) {
+                                    // 超過 150ms → 觸發 found
+                                    pair.reported = true;
+                                    info = extractDeviceInfo(address, pair);
+                                    triggerFound = true;
+                                }
+                            } else {
+                                // 已報告 → 觸發 updated（如果有 callback）
+                                if (scanUpdatedCallback_) {
+                                    info = extractDeviceInfo(address, pair);
+                                    triggerUpdated = true;
+                                }
+                            }
                         }
                     }
                 }
                 
-                if (scanCallback_) {
-                    scanCallback_(info);
+                // 在鎖外觸發回調
+                if (triggerFound && scanFoundCallback_) {
+                    scanFoundCallback_(info);
+                }
+                if (triggerUpdated && scanUpdatedCallback_) {
+                    scanUpdatedCallback_(info);
                 }
             });
             
             pImpl_->watcher.Start();
-        }  // ✅ 解鎖 mutex，讓回調可以執行
+        }
         
-        // ✅ 阻塞等待掃描完成
+        // 阻塞等待
         if (timeoutMs > 0) {
             int elapsed = 0;
             while (elapsed < timeoutMs) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 elapsed += 100;
                 
-                // 檢查是否已手動停止
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (pImpl_->scanStopped) {
-                        return true;  // 手動停止，提前返回
+                        break;
                     }
                 }
             }
             
-            // 時間到，自動停止
+            // 掃描結束，處理未報告的裝置
+            std::vector<DeviceInfo> unreported;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
+                
+                for (auto& [address, pair] : pImpl_->advPairs) {
+                    if (!pair.reported && pair.adv) {
+                        pair.reported = true;
+                        unreported.push_back(extractDeviceInfo(address, pair));
+                    }
+                }
+                
                 if (pImpl_->watcher) {
                     try {
                         pImpl_->watcher.Stop();
                         pImpl_->watcher = nullptr;
-                    } catch (...) {
-                    }
+                    } catch (...) {}
+                }
+            }
+            
+            // 觸發 found 回調（掃描結束時的兜底）
+            if (scanFoundCallback_) {
+                for (const auto& info : unreported) {
+                    scanFoundCallback_(info);
                 }
             }
         }
@@ -299,10 +485,6 @@ void WindowsBLE::stopScan() {
         } catch (...) {
         }
     }
-}
-
-void WindowsBLE::setScanCallback(ScanCallback callback) {
-    scanCallback_ = callback;
 }
 
 bool WindowsBLE::connect(const std::string& deviceAddress) {
@@ -333,7 +515,6 @@ bool WindowsBLE::connect(const std::string& deviceAddress) {
             std::cout << "  Device not paired. Initiating pairing..." << std::endl;
             std::cout << "  >> Please enter PIN: 000000 in the Windows dialog" << std::endl;
             
-            // 3. 發起配對（會觸發 Windows 對話框）
             auto pairResult = pairing.PairAsync().get();
             
             if (pairResult.Status() == DevicePairingResultStatus::Paired) {
@@ -369,13 +550,25 @@ bool WindowsBLE::connect(const std::string& deviceAddress) {
             std::cout << "  Device already paired" << std::endl;
         }
         
+        // 3. 建立 GATT Session（重要！）
+        std::cout << "  Creating GATT session..." << std::endl;
+        try {
+            pImpl_->session = GattSession::FromDeviceIdAsync(pImpl_->device.BluetoothDeviceId()).get();
+            if (pImpl_->session) {
+                // 設定為不維持連線（讓系統管理）
+                pImpl_->session.MaintainConnection(false);
+                std::cout << "  GATT session created" << std::endl;
+            }
+        } catch (...) {
+            std::cout << "  Warning: Failed to create GATT session (continuing...)" << std::endl;
+        }
+        
         // 4. 主動建立連線（透過 GATT 操作）
         std::cout << "  Establishing connection..." << std::endl;
         
         try {
-            // 嘗試獲取 GATT 服務來觸發連線
             auto servicesResult = pImpl_->device.GetGattServicesAsync(
-                BluetoothCacheMode::Uncached  // 強制建立新連線
+                BluetoothCacheMode::Uncached
             ).get();
             
             if (servicesResult.Status() != GattCommunicationStatus::Success) {
@@ -416,20 +609,78 @@ bool WindowsBLE::connect(const std::string& deviceAddress) {
 bool WindowsBLE::disconnect() {
     std::lock_guard<std::mutex> lock(mutex_);
     
-    if (pImpl_->device) {
-        try {
-            pImpl_->device.Close();
-            pImpl_->device = nullptr;
-            pImpl_->isConnected = false;
-            
-            if (connectionCallback_) {
-                connectionCallback_(false, "Disconnected");
-            }
-        } catch (...) {
-        }
+    if (!pImpl_->device) {
+        return true;  // 已經斷線
     }
     
-    return true;
+    try {
+        std::cout << "Disconnecting..." << std::endl;
+        
+        // 1. 移除所有通知訂閱
+        std::cout << "  Removing notification subscriptions..." << std::endl;
+        for (auto& [key, token] : pImpl_->notifyTokens) {
+            try {
+                auto it = pImpl_->characteristics.find(key);
+                if (it != pImpl_->characteristics.end()) {
+                    // 移除事件處理器
+                    it->second.ValueChanged(token);
+                    
+                    // 停用 CCCD
+                    it->second.WriteClientCharacteristicConfigurationDescriptorAsync(
+                        GattClientCharacteristicConfigurationDescriptorValue::None
+                    ).get();
+                }
+            } catch (...) {
+                // 忽略錯誤
+            }
+        }
+        pImpl_->notifyTokens.clear();
+        notifyCallbacks_.clear();
+        
+        // 2. 清空 characteristics 和 services
+        std::cout << "  Clearing characteristics and services..." << std::endl;
+        pImpl_->characteristics.clear();
+        pImpl_->services.clear();
+        
+        // 3. 關閉 GATT Session
+        if (pImpl_->session) {
+            std::cout << "  Closing GATT session..." << std::endl;
+            try {
+                pImpl_->session.Close();
+            } catch (...) {
+                // 忽略錯誤
+            }
+            pImpl_->session = nullptr;
+        }
+        
+        // 4. 關閉 device
+        std::cout << "  Closing device..." << std::endl;
+        if (pImpl_->device) {
+            try {
+                pImpl_->device.Close();
+            } catch (...) {
+                // 忽略錯誤
+            }
+            pImpl_->device = nullptr;
+        }
+        
+        pImpl_->isConnected = false;
+        
+        std::cout << "Disconnected successfully" << std::endl;
+        
+        if (connectionCallback_) {
+            connectionCallback_(false, "Disconnected");
+        }
+        
+        return true;
+        
+    } catch (const hresult_error& ex) {
+        setError("Disconnect failed: " + to_string(ex.message()));
+        return false;
+    } catch (...) {
+        setError("Disconnect failed: unknown error");
+        return false;
+    }
 }
 
 bool WindowsBLE::isConnected() const {
@@ -609,8 +860,8 @@ bool WindowsBLE::subscribeNotify(
         // 儲存回調
         notifyCallbacks_[key] = callback;
         
-        // 註冊值變化事件
-        characteristic.ValueChanged([this, key](
+        // 註冊值變化事件（保存返回的 token）
+        auto token = characteristic.ValueChanged([this, key](
             GattCharacteristic const&,
             GattValueChangedEventArgs args) {
             
@@ -624,6 +875,9 @@ bool WindowsBLE::subscribeNotify(
                 notifyCallbacks_[key](data.data(), data.size());
             }
         });
+        
+        // 保存 token（關鍵！）
+        pImpl_->notifyTokens[key] = token;
         
         // 寫入 CCCD 啟用通知
         auto result = characteristic.WriteClientCharacteristicConfigurationDescriptorAsync(
@@ -649,20 +903,36 @@ bool WindowsBLE::unsubscribeNotify(
 {
     try {
         std::string key = serviceUuid + ":" + charUuid;
-        auto it = pImpl_->characteristics.find(key);
         
-        if (it == pImpl_->characteristics.end()) {
+        // 1. 找到 characteristic
+        auto charIt = pImpl_->characteristics.find(key);
+        if (charIt == pImpl_->characteristics.end()) {
             return false;
         }
         
-        auto characteristic = it->second;
+        auto characteristic = charIt->second;
         
-        // 停用通知
-        characteristic.WriteClientCharacteristicConfigurationDescriptorAsync(
-            GattClientCharacteristicConfigurationDescriptorValue::None
-        ).get();
+        // 2. 移除事件處理器（使用保存的 token）
+        auto tokenIt = pImpl_->notifyTokens.find(key);
+        if (tokenIt != pImpl_->notifyTokens.end()) {
+            try {
+                characteristic.ValueChanged(tokenIt->second);
+                pImpl_->notifyTokens.erase(tokenIt);
+            } catch (...) {
+                // 忽略錯誤
+            }
+        }
         
-        // 移除回調
+        // 3. 停用 CCCD（告訴裝置停止發送通知）
+        try {
+            characteristic.WriteClientCharacteristicConfigurationDescriptorAsync(
+                GattClientCharacteristicConfigurationDescriptorValue::None
+            ).get();
+        } catch (...) {
+            // 忽略錯誤
+        }
+        
+        // 4. 移除回調
         notifyCallbacks_.erase(key);
         
         return true;

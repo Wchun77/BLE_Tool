@@ -17,9 +17,12 @@ public:
     bool initialize() override;
     void shutdown() override;
 
-    bool startScan(int timeoutMs) override;
+    bool startScan(
+        int timeoutMs,
+        ScanMode mode,
+        ScanFoundCallback foundCallback,
+        ScanUpdatedCallback updatedCallback) override;
     void stopScan() override;
-    void setScanCallback(ScanCallback callback) override;
 
     bool connect(const std::string& deviceAddress) override;
     bool disconnect() override;
@@ -59,14 +62,18 @@ private:
     
     mutable std::mutex mutex_;
     std::string lastError_;
-    ScanCallback scanCallback_;
+    
+    ScanFoundCallback scanFoundCallback_;
+    ScanUpdatedCallback scanUpdatedCallback_;
+    
     ConnectionCallback connectionCallback_;
     std::map<std::string, DataCallback> notifyCallbacks_;
 
     void setError(const std::string& error);
     
-    // 輔助函數（移到 .cpp 實作，避免型別問題）
+    // 輔助函數
     uint64_t addressStringToUint64(const std::string& address);
+    DeviceInfo extractDeviceInfo(const std::string& address, const struct AdvPair& pair);
 };
 
 } // namespace BLE
