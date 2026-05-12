@@ -58,7 +58,7 @@ public:
         const std::string& charUuid,
         std::vector<uint8_t>& outData);
     
-    // 便利函數：寫入字串（不包裝格式）
+    // 寫入字串（不包裝格式）
     bool writeString(
         const std::string& serviceUuid,
         const std::string& charUuid,

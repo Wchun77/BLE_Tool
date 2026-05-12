@@ -79,15 +79,15 @@ bool WindowsBLE::initialize() {
 }
 
 void WindowsBLE::shutdown() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
+    // 不在這裡加鎖，讓 disconnect() 和 stopScan() 自己管理各自的鎖
     stopScan();
     disconnect();
-    
+
+    std::lock_guard<std::mutex> lock(mutex_);
     pImpl_->services.clear();
     pImpl_->characteristics.clear();
     pImpl_->seenDevices.clear();
-    pImpl_->advPairs.clear();  // 清理配對
+    pImpl_->advPairs.clear();
 }
 
 // ============================================================================
@@ -607,80 +607,80 @@ bool WindowsBLE::connect(const std::string& deviceAddress) {
 }
 
 bool WindowsBLE::disconnect() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    if (!pImpl_->device) {
-        return true;  // 已經斷線
+    ConnectionCallback callbackToFire = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        if (!pImpl_->device) {
+            return true;
+        }
+
+        try {
+            std::cout << "Disconnecting..." << std::endl;
+
+            // 1. 移除所有通知訂閱
+            std::cout << "  Removing notification subscriptions..." << std::endl;
+            for (auto& [key, token] : pImpl_->notifyTokens) {
+                try {
+                    auto it = pImpl_->characteristics.find(key);
+                    if (it != pImpl_->characteristics.end()) {
+                        it->second.ValueChanged(token);
+                        it->second.WriteClientCharacteristicConfigurationDescriptorAsync(
+                            GattClientCharacteristicConfigurationDescriptorValue::None
+                        ).get();
+                    }
+                } catch (...) {}
+            }
+            pImpl_->notifyTokens.clear();
+            notifyCallbacks_.clear();
+
+            // 2. 清空 characteristics 和 services
+            std::cout << "  Clearing characteristics and services..." << std::endl;
+            pImpl_->characteristics.clear();
+            pImpl_->services.clear();
+
+            // 3. 關閉 GATT Session
+            if (pImpl_->session) {
+                std::cout << "  Closing GATT session..." << std::endl;
+                try {
+                    pImpl_->session.Close();
+                } catch (...) {}
+                pImpl_->session = nullptr;
+            }
+
+            // 4. 關閉 device
+            std::cout << "  Closing device..." << std::endl;
+            if (pImpl_->device) {
+                try {
+                    pImpl_->device.Close();
+                } catch (...) {}
+                pImpl_->device = nullptr;
+            }
+
+            pImpl_->isConnected = false;
+
+            std::cout << "Disconnected successfully" << std::endl;
+
+            // mutex 釋放前只存 callback，不在這裡呼叫
+            callbackToFire = connectionCallback_;
+
+        } catch (const hresult_error& ex) {
+            // 直接賦值，不呼叫 setError()，避免 recursive lock
+            lastError_ = "Disconnect failed: " + to_string(ex.message());
+            return false;
+        } catch (...) {
+            lastError_ = "Disconnect failed: unknown error";
+            return false;
+        }
+    }  // mutex 在這裡釋放
+
+    // mutex 釋放後才呼叫 callback，避免持鎖跨執行緒
+    if (callbackToFire) {
+        callbackToFire(false, "Disconnected");
     }
-    
-    try {
-        std::cout << "Disconnecting..." << std::endl;
-        
-        // 1. 移除所有通知訂閱
-        std::cout << "  Removing notification subscriptions..." << std::endl;
-        for (auto& [key, token] : pImpl_->notifyTokens) {
-            try {
-                auto it = pImpl_->characteristics.find(key);
-                if (it != pImpl_->characteristics.end()) {
-                    // 移除事件處理器
-                    it->second.ValueChanged(token);
-                    
-                    // 停用 CCCD
-                    it->second.WriteClientCharacteristicConfigurationDescriptorAsync(
-                        GattClientCharacteristicConfigurationDescriptorValue::None
-                    ).get();
-                }
-            } catch (...) {
-                // 忽略錯誤
-            }
-        }
-        pImpl_->notifyTokens.clear();
-        notifyCallbacks_.clear();
-        
-        // 2. 清空 characteristics 和 services
-        std::cout << "  Clearing characteristics and services..." << std::endl;
-        pImpl_->characteristics.clear();
-        pImpl_->services.clear();
-        
-        // 3. 關閉 GATT Session
-        if (pImpl_->session) {
-            std::cout << "  Closing GATT session..." << std::endl;
-            try {
-                pImpl_->session.Close();
-            } catch (...) {
-                // 忽略錯誤
-            }
-            pImpl_->session = nullptr;
-        }
-        
-        // 4. 關閉 device
-        std::cout << "  Closing device..." << std::endl;
-        if (pImpl_->device) {
-            try {
-                pImpl_->device.Close();
-            } catch (...) {
-                // 忽略錯誤
-            }
-            pImpl_->device = nullptr;
-        }
-        
-        pImpl_->isConnected = false;
-        
-        std::cout << "Disconnected successfully" << std::endl;
-        
-        if (connectionCallback_) {
-            connectionCallback_(false, "Disconnected");
-        }
-        
-        return true;
-        
-    } catch (const hresult_error& ex) {
-        setError("Disconnect failed: " + to_string(ex.message()));
-        return false;
-    } catch (...) {
-        setError("Disconnect failed: unknown error");
-        return false;
-    }
+
+    return true;
 }
 
 bool WindowsBLE::isConnected() const {
@@ -849,48 +849,59 @@ bool WindowsBLE::subscribeNotify(
     try {
         std::string key = serviceUuid + ":" + charUuid;
         auto it = pImpl_->characteristics.find(key);
-        
+
         if (it == pImpl_->characteristics.end()) {
             setError("Characteristic not found");
             return false;
         }
-        
+
         auto characteristic = it->second;
-        
+
         // 儲存回調
         notifyCallbacks_[key] = callback;
-        
-        // 註冊值變化事件（保存返回的 token）
+
+        // 註冊值變化事件
         auto token = characteristic.ValueChanged([this, key](
             GattCharacteristic const&,
             GattValueChangedEventArgs args) {
-            
+
             auto buffer = args.CharacteristicValue();
             DataReader reader = DataReader::FromBuffer(buffer);
-            
+
             std::vector<uint8_t> data(buffer.Length());
             reader.ReadBytes(data);
-            
-            if (notifyCallbacks_.count(key) > 0 && notifyCallbacks_[key]) {
-                notifyCallbacks_[key](data.data(), data.size());
+
+            // 加鎖保護讀取，避免 disconnect() clear() 時的 race condition
+            DataCallback callbackToFire = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto it = notifyCallbacks_.find(key);
+                if (it != notifyCallbacks_.end() && it->second) {
+                    callbackToFire = it->second;
+                }
+            }
+
+            // 鎖外呼叫 callback，避免持鎖跨執行緒
+            if (callbackToFire) {
+                callbackToFire(data.data(), data.size());
             }
         });
-        
-        // 保存 token（關鍵！）
+
+        // 保存 token
         pImpl_->notifyTokens[key] = token;
-        
+
         // 寫入 CCCD 啟用通知
         auto result = characteristic.WriteClientCharacteristicConfigurationDescriptorAsync(
             GattClientCharacteristicConfigurationDescriptorValue::Notify
         ).get();
-        
+
         if (result != GattCommunicationStatus::Success) {
             setError("Failed to enable notifications");
             return false;
         }
-        
+
         return true;
-        
+
     } catch (const hresult_error& ex) {
         setError("Subscribe notify failed: " + to_string(ex.message()));
         return false;
