@@ -742,7 +742,7 @@ Windows BLE API 會分別接收 Advertisement 和 Scan Response 兩個封包。�
 
 ## 授權
 
-內部使用專案，未對外發布。
+本專案以 [MIT License](LICENSE) 授權發布。
 
 ---
 
