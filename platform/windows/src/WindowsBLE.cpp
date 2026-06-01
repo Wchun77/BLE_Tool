@@ -848,9 +848,16 @@ bool WindowsBLE::subscribeNotify(
 {
     try {
         std::string key = serviceUuid + ":" + charUuid;
+        std::cout << "subscribeNotify key: " << key << std::endl;
+        std::cout << "characteristics count: " << pImpl_->characteristics.size() << std::endl;
+
         auto it = pImpl_->characteristics.find(key);
 
         if (it == pImpl_->characteristics.end()) {
+            std::cout << "  NOT FOUND, available keys:" << std::endl;
+            for (const auto& pair : pImpl_->characteristics) {
+                std::cout << "  - " << pair.first << std::endl;
+            }
             setError("Characteristic not found");
             return false;
         }
@@ -861,9 +868,12 @@ bool WindowsBLE::subscribeNotify(
         notifyCallbacks_[key] = callback;
 
         // 註冊值變化事件
+        std::cout << "  Registering ValueChanged..." << std::endl;
         auto token = characteristic.ValueChanged([this, key](
             GattCharacteristic const&,
             GattValueChangedEventArgs args) {
+
+            std::cout << "  ValueChanged triggered!" << std::endl;
 
             auto buffer = args.CharacteristicValue();
             DataReader reader = DataReader::FromBuffer(buffer);
@@ -886,16 +896,25 @@ bool WindowsBLE::subscribeNotify(
                 callbackToFire(data.data(), data.size());
             }
         });
+        std::cout << "  ValueChanged registered" << std::endl;
 
         // 保存 token
         pImpl_->notifyTokens[key] = token;
 
         // 寫入 CCCD 啟用通知
-        auto result = characteristic.WriteClientCharacteristicConfigurationDescriptorAsync(
-            GattClientCharacteristicConfigurationDescriptorValue::Notify
-        ).get();
+        std::cout << "  Writing CCCD..." << std::endl;
+        try {
+            auto result = characteristic.WriteClientCharacteristicConfigurationDescriptorAsync(
+                GattClientCharacteristicConfigurationDescriptorValue::Notify
+            ).get();
+            std::cout << "  CCCD done, status=" << (int)result << std::endl;
 
-        if (result != GattCommunicationStatus::Success) {
+            if (result != GattCommunicationStatus::Success) {
+                setError("Failed to enable notifications");
+                return false;
+            }
+        } catch (...) {
+            std::cout << "  CCCD write exception" << std::endl;
             setError("Failed to enable notifications");
             return false;
         }
@@ -903,6 +922,7 @@ bool WindowsBLE::subscribeNotify(
         return true;
 
     } catch (const hresult_error& ex) {
+        std::cout << "subscribeNotify exception: " << to_string(ex.message()) << std::endl;
         setError("Subscribe notify failed: " + to_string(ex.message()));
         return false;
     }
