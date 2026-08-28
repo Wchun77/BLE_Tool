@@ -901,22 +901,15 @@ bool WindowsBLE::subscribeNotify(
         // 保存 token
         pImpl_->notifyTokens[key] = token;
 
-        // 寫入 CCCD 啟用通知
+        // 嘗試寫入 CCCD，失敗時僅警告
         std::cout << "  Writing CCCD..." << std::endl;
         try {
             auto result = characteristic.WriteClientCharacteristicConfigurationDescriptorAsync(
                 GattClientCharacteristicConfigurationDescriptorValue::Notify
             ).get();
             std::cout << "  CCCD done, status=" << (int)result << std::endl;
-
-            if (result != GattCommunicationStatus::Success) {
-                setError("Failed to enable notifications");
-                return false;
-            }
         } catch (...) {
-            std::cout << "  CCCD write exception" << std::endl;
-            setError("Failed to enable notifications");
-            return false;
+            std::cout << "  Warning: CCCD write exception, continuing..." << std::endl;
         }
 
         return true;
