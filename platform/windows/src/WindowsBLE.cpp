@@ -41,6 +41,7 @@ struct WindowsBLE::Impl {
     std::unordered_map<std::string, GattDeviceService> services;
     std::unordered_map<std::string, GattCharacteristic> characteristics;
     std::unordered_map<std::string, event_token> notifyTokens; // 儲存通知訂閱的 token
+    event_token connectionStatusToken{}; // BluetoothLEDevice.ConnectionStatusChanged 的訂閱 token
     std::set<std::string> seenDevices;
     std::unordered_map<std::string, AdvPair> advPairs;  // 儲存配對
     bool isConnected = false;
@@ -593,11 +594,36 @@ bool WindowsBLE::connect(const std::string& deviceAddress) {
         }
         
         std::cout << "  Connected!" << std::endl;
-        
+
         if (connectionCallback_) {
             connectionCallback_(pImpl_->isConnected, "Connected");
         }
-        
+
+        // 6. 訂閱連線狀態變化事件
+        // isConnected() 原本只回傳我方自己維護的快取旗標,裝置斷電或訊號中斷等
+        // 「非我方主動斷線」的情況不會有人更新它,導致狀態卡住。
+        // ConnectionStatusChanged 是 OS 層對實際連線狀態的即時推播,訂閱後才能
+        // 真正偵測到這類斷線。
+        pImpl_->connectionStatusToken = pImpl_->device.ConnectionStatusChanged(
+            [this](BluetoothLEDevice const& sender, IInspectable const&) {
+                bool nowConnected = (sender.ConnectionStatus() == BluetoothConnectionStatus::Connected);
+                ConnectionCallback callbackToFire = nullptr;
+
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (pImpl_->isConnected == nowConnected) {
+                        return; // 狀態沒變,不重複觸發
+                    }
+                    pImpl_->isConnected = nowConnected;
+                    callbackToFire = connectionCallback_;
+                }
+
+                if (callbackToFire) {
+                    callbackToFire(nowConnected, nowConnected ? "Connected" : "Connection lost");
+                }
+            }
+        );
+
         return true;
         
     } catch (const hresult_error& ex) {
@@ -639,6 +665,13 @@ bool WindowsBLE::disconnect() {
             std::cout << "  Clearing characteristics and services..." << std::endl;
             pImpl_->characteristics.clear();
             pImpl_->services.clear();
+
+            // 2.5 撤銷連線狀態變化訂閱
+            if (pImpl_->device) {
+                try {
+                    pImpl_->device.ConnectionStatusChanged(pImpl_->connectionStatusToken);
+                } catch (...) {}
+            }
 
             // 3. 關閉 GATT Session
             if (pImpl_->session) {
