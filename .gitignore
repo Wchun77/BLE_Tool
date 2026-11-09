@@ -1,7 +1,6 @@
-# Build directories
+# Build directories (編譯產物都在 build/ 底下)
+# ⚠ 不可以忽略 lib/：lib/ 是 ble_api 的原始碼 (ble_api.h / ble_api.cpp)
 build/
-bin/
-lib/
 
 # Visual Studio
 .vs/
