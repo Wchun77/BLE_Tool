@@ -414,6 +414,11 @@ void BLE_SetErrorCallback(BLE_HANDLE handle, BLE_ErrorCallback callback, void* u
 
 // === 版本資訊 ===
 
+// 版本號在最外層 CMakeLists.txt 的 project(... VERSION x.y.z)，由 lib/CMakeLists.txt 傳進來
+#ifndef BLE_API_VERSION
+#error "BLE_API_VERSION 未定義，請用 CMake 重新產生專案 (build.bat)"
+#endif
+
 const char* BLE_GetVersion(void) {
-    return "1.2.0";
+    return BLE_API_VERSION;
 }

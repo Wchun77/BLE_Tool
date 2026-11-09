@@ -20,6 +20,9 @@ target_link_libraries(ble_api
 # DLL 導出設定
 target_compile_definitions(ble_api PRIVATE BLE_API_EXPORTS)
 
+# 版本號來自最外層 project(... VERSION x.y.z)，BLE_GetVersion() 回傳這個字串
+target_compile_definitions(ble_api PRIVATE BLE_API_VERSION="${PROJECT_VERSION}")
+
 # 輸出名稱
 set_target_properties(ble_api PROPERTIES
     OUTPUT_NAME "ble_api"

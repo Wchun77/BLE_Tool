@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
-project(BLE_Tool VERSION 1.0.0 LANGUAGES CXX)
+# 版本號只改這裡：會傳進 ble_api (BLE_GetVersion 回傳的就是這個)
+project(BLE_Tool VERSION 1.2.0 LANGUAGES CXX)
 
 # C++ 標準
 set(CMAKE_CXX_STANDARD 17)
