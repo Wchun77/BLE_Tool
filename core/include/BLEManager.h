@@ -36,6 +36,11 @@ public:
     bool disconnect();
     bool isConnected() const;
     void setConnectionCallback(ConnectionCallback callback);
+
+    // 配對
+    void setPairingPin(const std::string& pin);
+    int isPaired(const std::string& deviceAddress);
+    bool unpair(const std::string& deviceAddress);
     
     // 根據名稱連線
     bool connectByName(const std::string& deviceName);

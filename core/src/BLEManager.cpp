@@ -139,6 +139,31 @@ void BLEManager::setConnectionCallback(ConnectionCallback callback) {
     }
 }
 
+// 配對
+void BLEManager::setPairingPin(const std::string& pin) {
+    if (backend_) {
+        backend_->setPairingPin(pin);
+    }
+}
+
+int BLEManager::isPaired(const std::string& deviceAddress) {
+    if (!initialized_) {
+        handleError("BLE Manager not initialized");
+        return -1;
+    }
+
+    return backend_->isPaired(deviceAddress);
+}
+
+bool BLEManager::unpair(const std::string& deviceAddress) {
+    if (!initialized_) {
+        handleError("BLE Manager not initialized");
+        return false;
+    }
+
+    return backend_->unpair(deviceAddress);
+}
+
 // 根據名稱連線
 bool BLEManager::connectByName(const std::string& deviceName) {
     if (!initialized_) {

@@ -488,6 +488,137 @@ void WindowsBLE::stopScan() {
     }
 }
 
+// ============================================================================
+// 配對
+// ============================================================================
+
+static std::string pairingStatusToString(DevicePairingResultStatus status) {
+    switch (status) {
+        case DevicePairingResultStatus::Paired:                 return "Paired";
+        case DevicePairingResultStatus::AlreadyPaired:          return "Already paired";
+        case DevicePairingResultStatus::PairingCanceled:        return "User canceled";
+        case DevicePairingResultStatus::AuthenticationTimeout:  return "Authentication timeout";
+        case DevicePairingResultStatus::AuthenticationFailure:  return "Authentication failure (wrong PIN?)";
+        case DevicePairingResultStatus::ConnectionRejected:     return "Connection rejected";
+        case DevicePairingResultStatus::NotReadyToPair:         return "Not ready to pair";
+        case DevicePairingResultStatus::Failed:                 return "Failed";
+        default: {
+            char buf[32];
+            sprintf_s(buf, sizeof(buf), "Status %d", static_cast<int>(status));
+            return buf;
+        }
+    }
+}
+
+// 用自訂配對帶入配對碼。
+// 裝置 (ESP32, IO_CAP_OUT + 靜態 passkey) 要求的是 ProvidePin；
+// 其他種類一併接受，避免裝置端 IO 能力不同時配對被拒。
+// ⚠ 內部用 .get() 等待，不可以在 STA 執行緒 (UI 執行緒) 呼叫
+static DevicePairingResultStatus pairWithPin(const DeviceInformation& deviceInfo, const std::string& pin) {
+    auto custom = deviceInfo.Pairing().Custom();
+    winrt::hstring hpin = winrt::to_hstring(pin);
+
+    auto token = custom.PairingRequested(
+        [hpin](DeviceInformationCustomPairing const&, DevicePairingRequestedEventArgs const& args) {
+            switch (args.PairingKind()) {
+                case DevicePairingKinds::ProvidePin:
+                    args.Accept(hpin);
+                    break;
+                case DevicePairingKinds::ConfirmOnly:
+                case DevicePairingKinds::ConfirmPinMatch:
+                case DevicePairingKinds::DisplayPin:
+                    args.Accept();
+                    break;
+                default:
+                    break;  // 不接受 = 配對失敗
+            }
+        });
+
+    DevicePairingResultStatus status = DevicePairingResultStatus::Failed;
+    try {
+        auto kinds = DevicePairingKinds::ProvidePin | DevicePairingKinds::ConfirmOnly |
+                     DevicePairingKinds::ConfirmPinMatch | DevicePairingKinds::DisplayPin;
+        status = custom.PairAsync(kinds, DevicePairingProtectionLevel::EncryptionAndAuthentication).get().Status();
+    } catch (const hresult_error& ex) {
+        std::cout << "  Pairing exception: " << to_string(ex.message()) << std::endl;
+    }
+
+    custom.PairingRequested(token);
+    return status;
+}
+
+void WindowsBLE::setPairingPin(const std::string& pin) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pairingPin_ = pin;
+}
+
+int WindowsBLE::isPaired(const std::string& deviceAddress) {
+    try {
+        uint64_t addr = addressStringToUint64(deviceAddress);
+        if (addr == 0) {
+            setError("Invalid device address format");
+            return -1;
+        }
+
+        auto device = BluetoothLEDevice::FromBluetoothAddressAsync(addr).get();
+        if (!device) {
+            setError("Failed to get BluetoothLEDevice");
+            return -1;
+        }
+
+        bool paired = device.DeviceInformation().Pairing().IsPaired();
+        device.Close();
+        return paired ? 1 : 0;
+
+    } catch (const hresult_error& ex) {
+        setError("IsPaired failed: " + to_string(ex.message()));
+        return -1;
+    }
+}
+
+bool WindowsBLE::unpair(const std::string& deviceAddress) {
+    try {
+        uint64_t addr = addressStringToUint64(deviceAddress);
+        if (addr == 0) {
+            setError("Invalid device address format");
+            return false;
+        }
+
+        // 正在連線的就是這台：先斷線，避免連線中的物件還握著舊的 GATT
+        bool isCurrent = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            isCurrent = pImpl_->device && (pImpl_->device.BluetoothAddress() == addr);
+        }
+        if (isCurrent) {
+            disconnect();
+        }
+
+        auto device = BluetoothLEDevice::FromBluetoothAddressAsync(addr).get();
+        if (!device) {
+            setError("Failed to get BluetoothLEDevice");
+            return false;
+        }
+
+        auto result = device.DeviceInformation().Pairing().UnpairAsync().get();
+        device.Close();
+
+        auto status = result.Status();
+        if (status == DeviceUnpairingResultStatus::Unpaired ||
+            status == DeviceUnpairingResultStatus::AlreadyUnpaired) {
+            std::cout << "  Unpaired" << std::endl;
+            return true;
+        }
+
+        setError("Unpair failed: status " + std::to_string(static_cast<int>(status)));
+        return false;
+
+    } catch (const hresult_error& ex) {
+        setError("Unpair failed: " + to_string(ex.message()));
+        return false;
+    }
+}
+
 bool WindowsBLE::connect(const std::string& deviceAddress) {
     try {
         uint64_t addr = addressStringToUint64(deviceAddress);
@@ -513,38 +644,31 @@ bool WindowsBLE::connect(const std::string& deviceAddress) {
         std::cout << "  Checking pairing status..." << std::endl;
         
         if (!pairing.IsPaired()) {
-            std::cout << "  Device not paired. Initiating pairing..." << std::endl;
-            std::cout << "  >> Please enter PIN: 000000 in the Windows dialog" << std::endl;
-            
-            auto pairResult = pairing.PairAsync().get();
-            
-            if (pairResult.Status() == DevicePairingResultStatus::Paired) {
+            DevicePairingResultStatus status;
+
+            std::string pin;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                pin = pairingPin_;
+            }
+
+            if (!pin.empty()) {
+                // 有設定配對碼：自己帶入配對碼 (不跳系統視窗、使用者不用先到 Windows 設定配對)
+                std::cout << "  Device not paired. Pairing with preset PIN..." << std::endl;
+                status = pairWithPin(deviceInfo, pin);
+            } else {
+                // 沒設定配對碼：維持原本行為，由系統處理 (可能跳出 Windows 配對視窗)
+                std::cout << "  Device not paired. Initiating pairing..." << std::endl;
+                std::cout << "  >> Please enter PIN in the Windows dialog" << std::endl;
+                status = pairing.PairAsync().get().Status();
+            }
+
+            if (status == DevicePairingResultStatus::Paired) {
                 std::cout << "  Pairing successful!" << std::endl;
-            } else if (pairResult.Status() == DevicePairingResultStatus::AlreadyPaired) {
+            } else if (status == DevicePairingResultStatus::AlreadyPaired) {
                 std::cout << "  Already paired" << std::endl;
             } else {
-                std::string errorMsg = "Pairing failed: ";
-                switch (pairResult.Status()) {
-                    case DevicePairingResultStatus::PairingCanceled:
-                        errorMsg += "User canceled";
-                        break;
-                    case DevicePairingResultStatus::AuthenticationTimeout:
-                        errorMsg += "Authentication timeout";
-                        break;
-                    case DevicePairingResultStatus::AuthenticationFailure:
-                        errorMsg += "Authentication failure (wrong PIN?)";
-                        break;
-                    case DevicePairingResultStatus::ConnectionRejected:
-                        errorMsg += "Connection rejected";
-                        break;
-                    case DevicePairingResultStatus::Failed:
-                        errorMsg += "Failed";
-                        break;
-                    default:
-                        errorMsg += "Unknown error";
-                        break;
-                }
-                setError(errorMsg);
+                setError("Pairing failed: " + pairingStatusToString(status));
                 return false;
             }
         } else {
@@ -736,7 +860,9 @@ bool WindowsBLE::discoverServices() {
         pImpl_->characteristics.clear();
         
         // 取得所有 GATT 服務
-        auto servicesResult = pImpl_->device.GetGattServicesAsync().get();
+        // ⚠ 用 Uncached：預設的 Cached 會沿用 Windows 記住的舊 GATT 結構，
+        //   韌體新增/修改特徵後會找不到新特徵，以前只能移除配對重配。
+        auto servicesResult = pImpl_->device.GetGattServicesAsync(BluetoothCacheMode::Uncached).get();
         
         if (servicesResult.Status() != GattCommunicationStatus::Success) {
             setError("Failed to discover services");
@@ -751,7 +877,7 @@ bool WindowsBLE::discoverServices() {
             // 使用 emplace 而不是 operator[]
             pImpl_->services.emplace(uuid, service);
             
-            auto charsResult = service.GetCharacteristicsAsync().get();
+            auto charsResult = service.GetCharacteristicsAsync(BluetoothCacheMode::Uncached).get();
             if (charsResult.Status() == GattCommunicationStatus::Success) {
                 auto chars = charsResult.Characteristics();
                 for (uint32_t j = 0; j < chars.Size(); j++) {

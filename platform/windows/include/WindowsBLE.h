@@ -29,6 +29,10 @@ public:
     bool isConnected() const override;
     void setConnectionCallback(ConnectionCallback callback) override;
 
+    void setPairingPin(const std::string& pin) override;
+    int isPaired(const std::string& deviceAddress) override;
+    bool unpair(const std::string& deviceAddress) override;
+
     bool discoverServices() override;
     std::vector<std::string> getServices() override;
     std::vector<std::string> getCharacteristics(const std::string& serviceUuid) override;
@@ -67,6 +71,7 @@ private:
     ScanUpdatedCallback scanUpdatedCallback_;
     
     ConnectionCallback connectionCallback_;
+    std::string pairingPin_;    // 空字串 = 用系統配對 (原本的行為)
     std::map<std::string, DataCallback> notifyCallbacks_;
 
     void setError(const std::string& error);
